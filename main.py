@@ -3,8 +3,9 @@ import os
 from datetime import datetime
 import sqlite3
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, ConversationHandler
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from dotenv import load_dotenv
+import re
 
 load_dotenv()
 
@@ -36,10 +37,10 @@ class EscrowBot:
                       creator_id INTEGER,
                       buyer_id INTEGER,
                       seller_id INTEGER,
-                      amount REAL,
+                      original_amount REAL,
                       fees_percentage REAL,
                       fees_amount REAL,
-                      net_amount REAL,
+                      final_amount REAL,
                       status TEXT,
                       created_at TIMESTAMP,
                       description TEXT,
@@ -70,38 +71,37 @@ class EscrowBot:
         finally:
             conn.close()
     
-    def create_deal_with_fees(self, creator_id, amount, fees_percentage):
+    def create_deal_with_fees(self, creator_id, buyer_id, seller_id, original_amount, fees_percentage, description=""):
         """Create new escrow deal with fees calculation"""
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         deal_id = f"DEAL-{datetime.now().strftime('%Y%m%d%H%M%S')}"
         
         # Calculate fees
-        fees_amount = (amount * fees_percentage) / 100
-        net_amount = amount - fees_amount
+        fees_amount = (original_amount * fees_percentage) / 100
+        final_amount = original_amount - fees_amount
         
         try:
             c.execute('''INSERT INTO deals 
-                        (deal_id, creator_id, buyer_id, seller_id, amount, fees_percentage, fees_amount, net_amount, status, created_at, description, confirmations)
+                        (deal_id, creator_id, buyer_id, seller_id, original_amount, fees_percentage, fees_amount, final_amount, status, created_at, description, confirmations)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                     (deal_id, creator_id, creator_id, self.OWNER_ID, amount, fees_percentage, fees_amount, net_amount, 'pending', datetime.now(), 'Added via /add command', '[]'))
+                     (deal_id, creator_id, buyer_id, seller_id, original_amount, fees_percentage, fees_amount, final_amount, 'pending', datetime.now(), description, '[]'))
             conn.commit()
             conn.close()
-            return deal_id, fees_amount, net_amount
+            return deal_id, final_amount, fees_amount
         except Exception as e:
             logger.error(f"Error creating deal: {e}")
-            conn.close()
             return None, None, None
     
     def create_deal(self, creator_id, buyer_id, seller_id, amount, description):
-        """Create new escrow deal"""
+        """Create new escrow deal without fees"""
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         deal_id = f"DEAL-{datetime.now().strftime('%Y%m%d%H%M%S')}"
         
         try:
             c.execute('''INSERT INTO deals 
-                        (deal_id, creator_id, buyer_id, seller_id, amount, fees_percentage, fees_amount, net_amount, status, created_at, description, confirmations)
+                        (deal_id, creator_id, buyer_id, seller_id, original_amount, fees_percentage, fees_amount, final_amount, status, created_at, description, confirmations)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                      (deal_id, creator_id, buyer_id, seller_id, amount, 0, 0, amount, 'pending', datetime.now(), description, '[]'))
             conn.commit()
@@ -109,7 +109,6 @@ class EscrowBot:
             return deal_id
         except Exception as e:
             logger.error(f"Error creating deal: {e}")
-            conn.close()
             return None
     
     def get_all_deals(self):
@@ -141,14 +140,10 @@ class EscrowBot:
             return True
         except Exception as e:
             logger.error(f"Error deleting deal: {e}")
-            conn.close()
             return False
 
 # Initialize bot
 bot = EscrowBot()
-
-# Conversation states
-DEAL_STEP_BUYER, DEAL_STEP_SELLER, DEAL_STEP_AMOUNT, DEAL_STEP_DESC = range(4)
 
 # ============ COMMAND HANDLERS ============
 
@@ -179,10 +174,9 @@ This bot helps you manage secure escrow transactions between buyers and sellers.
 
 **Key Features:**
 ✅ Create secure deals
+✅ Quick add with fees
 ✅ Track transactions
 ✅ View deal history
-✅ Real-time updates
-✅ Quick /add command with fees
 
 Ready to get started?
 """
@@ -193,34 +187,31 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = """
 📖 **HELP - All Commands**
 
-🔥 **Quick Add Command:**
-/add <amount> <fees%> - Create deal with fees (Auto deletes message)
-Example: /add 1000 5%
-
 🎯 **Main Commands:**
 /start - Go to main menu
 /help - Show this message
 /id - Get your user ID
-/createdeals - Create new deal (manual)
+
+📊 **Deal Commands:**
+/add <amount> <fees%> - Quick add deal with fees
+   Example: /add 1000 5%
+   (Amount: 1000, Fees: 5% = 50, Final: 950)
+
+/createdeals - Create detailed deal
 /deals - View all deals
 /stats - Bot statistics
 
-🤝 **Deal Commands:**
-/cleardeal - Clear all deals (Owner)
-/deletedeal - Delete specific deal (Owner)
+⚙️ **Owner Commands:**
+/cleardeal - Clear all deals
+/deletedeal <deal_id> - Delete specific deal
 
-💡 **How /add works:**
+**How /add works:**
 1. Send: /add 1000 5%
-2. Amount: 1000
-3. Fees: 5% = 50
-4. Net (Escrow gets): 950
-5. Message auto-deletes
-6. Deal created instantly
+2. Bot creates deal automatically
+3. Message gets deleted
+4. Fees calculated: 1000 - (1000 × 5%) = 950
 
-👨‍💼 **Owner:** @underlimitz
-🆔 **Owner ID:** 7967147174
-
-Need help? Contact the owner!
+**Contact:** @underlimitz
 """
     await update.message.reply_text(help_text, parse_mode='Markdown')
 
@@ -238,92 +229,6 @@ Username: @{user.username or 'Not set'}
 """
     await update.message.reply_text(text, parse_mode='Markdown')
 
-async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Quick add command - /add <amount> <fees%>"""
-    user = update.effective_user
-    
-    # Check if user provided correct arguments
-    if len(context.args) != 2:
-        await update.message.reply_text(
-            "❌ **Invalid format!**\n\n"
-            "Usage: `/add <amount> <fees%>`\n\n"
-            "Example: `/add 1000 5%`\n\n"
-            "This will create a deal with:\n"
-            "- Amount: 1000\n"
-            "- Fees: 5% (= 50)\n"
-            "- Net Amount: 950",
-            parse_mode='Markdown'
-        )
-        return
-    
-    try:
-        # Parse amount
-        amount = float(context.args[0])
-        
-        # Parse fees (remove % if present)
-        fees_str = context.args[1].replace('%', '')
-        fees_percentage = float(fees_str)
-        
-        # Validate inputs
-        if amount <= 0:
-            await update.message.reply_text("❌ Amount must be greater than 0")
-            return
-        
-        if fees_percentage < 0 or fees_percentage > 100:
-            await update.message.reply_text("❌ Fees must be between 0 and 100%")
-            return
-        
-        # Create deal with fees
-        deal_id, fees_amount, net_amount = bot.create_deal_with_fees(
-            creator_id=user.id,
-            amount=amount,
-            fees_percentage=fees_percentage
-        )
-        
-        if deal_id:
-            # Create success message
-            success_text = f"""
-✅ **Deal Created Successfully!**
-
-📌 Deal ID: `{deal_id}`
-👤 Creator: {user.id}
-💰 Amount: ${amount:,.2f}
-💸 Fees: {fees_percentage}% (${fees_amount:,.2f})
-🏦 Net Amount: ${net_amount:,.2f}
-📅 Status: PENDING
-
-⏱️ Message will be deleted in 5 seconds...
-"""
-            
-            # Send success message
-            msg = await update.message.reply_text(success_text, parse_mode='Markdown')
-            
-            # Delete original command message
-            try:
-                await update.message.delete()
-            except Exception as e:
-                logger.warning(f"Could not delete message: {e}")
-            
-            # Delete success message after 5 seconds
-            import asyncio
-            await asyncio.sleep(5)
-            try:
-                await msg.delete()
-            except Exception as e:
-                logger.warning(f"Could not delete success message: {e}")
-        else:
-            await update.message.reply_text("❌ Error creating deal. Try again.")
-    
-    except ValueError:
-        await update.message.reply_text(
-            "❌ **Invalid input!**\n\n"
-            "Please provide:\n"
-            "- Amount (number): 1000\n"
-            "- Fees (number with %): 5%\n\n"
-            "Example: `/add 1000 5%`",
-            parse_mode='Markdown'
-        )
-
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show statistics"""
     deals = bot.get_all_deals()
@@ -331,8 +236,9 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_deals = len(deals)
     pending_deals = len([d for d in deals if d[9] == 'pending'])
     completed_deals = len([d for d in deals if d[9] == 'completed'])
-    total_amount = sum([d[5] for d in deals]) if deals else 0
+    total_original = sum([d[5] for d in deals]) if deals else 0
     total_fees = sum([d[7] for d in deals]) if deals else 0
+    total_final = sum([d[8] for d in deals]) if deals else 0
     
     stats_text = f"""
 📊 **Bot Statistics:**
@@ -340,13 +246,93 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Total Deals: {total_deals}
 Pending: {pending_deals}
 Completed: {completed_deals}
-Total Amount: ${total_amount:,.2f}
-Total Fees Collected: ${total_fees:,.2f}
 
-👥 Deals are managed securely
-🔐 All transactions tracked
+💰 **Financial:**
+Total Original: ${total_original:,.2f}
+Total Fees: ${total_fees:,.2f}
+Total Final: ${total_final:,.2f}
+
+🔐 All transactions tracked securely
 """
     await update.message.reply_text(stats_text, parse_mode='Markdown')
+
+# ============ ADD COMMAND - NEW FEATURE ============
+
+async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Quick add deal with fees - /add <amount> <fees%>"""
+    user = update.effective_user
+    bot.add_user(user.id, user.username or "Unknown")
+    
+    if len(context.args) != 2:
+        await update.message.reply_text(
+            "❌ Invalid format!\n\n"
+            "Usage: /add <amount> <fees%>\n"
+            "Example: /add 1000 5%\n\n"
+            "This will create a deal with:\n"
+            "Amount: 1000\n"
+            "Fees: 5% (50)\n"
+            "Final: 950"
+        )
+        return
+    
+    try:
+        amount_str = context.args[0]
+        fees_str = context.args[1]
+        
+        # Parse amount
+        amount = float(amount_str)
+        
+        # Parse fees (remove % if present)
+        fees_str = fees_str.replace('%', '')
+        fees_percentage = float(fees_str)
+        
+        if amount <= 0 or fees_percentage < 0:
+            await update.message.reply_text("❌ Amount and fees must be positive numbers!")
+            return
+        
+        if fees_percentage > 100:
+            await update.message.reply_text("❌ Fees cannot exceed 100%!")
+            return
+        
+        # Create deal
+        buyer_id = user.id
+        seller_id = bot.OWNER_ID
+        description = f"Quick deal created with /add command"
+        
+        deal_id, final_amount, fees_amount = bot.create_deal_with_fees(
+            user.id, buyer_id, seller_id, amount, fees_percentage, description
+        )
+        
+        if deal_id:
+            # Send success message
+            success_text = f"""
+✅ **Deal Created Successfully!**
+
+📌 Deal ID: `{deal_id}`
+💰 Original Amount: ${amount:,.2f}
+📊 Fees: {fees_percentage}% (${fees_amount:,.2f})
+💵 Final Amount: ${final_amount:,.2f}
+📅 Status: PENDING
+
+Deal has been added to the system!
+"""
+            msg = await update.message.reply_text(success_text, parse_mode='Markdown')
+            
+            # Delete the command message
+            try:
+                await update.message.delete()
+            except Exception as e:
+                logger.error(f"Could not delete message: {e}")
+        else:
+            await update.message.reply_text("❌ Error creating deal. Try again.")
+    
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Invalid input!\n\n"
+            "Please use:\n"
+            "/add <amount> <fees%>\n"
+            "Example: /add 1000 5%"
+        )
 
 # ============ BUTTON CALLBACKS ============
 
@@ -375,12 +361,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📌 **Deal ID:** {deal[1]}
 👤 Creator: {deal[2]}
 Buyer: {deal[3]} | Seller: {deal[4]}
-💰 Amount: ${deal[5]:,.2f}
-💸 Fees: {deal[6]}% (${deal[7]:,.2f})
-🏦 Net: ${deal[8]:,.2f}
-📅 Created: {deal[10]}
+💰 Original: ${deal[5]:,.2f}
+📊 Fees: {deal[6]}% (${deal[7]:,.2f})
+💵 Final: ${deal[8]:,.2f}
 Status: {deal[9].upper()}
-─────────────────"""
+─────────────"""
         
         await query.edit_message_text(text=deals_text, parse_mode='Markdown')
     
@@ -403,7 +388,7 @@ Status: {deal[9].upper()}
 Total Deals: {total}
 Pending: {pending}
 Completed: {completed}
-Total Fees: ${total_fees:,.2f}
+Total Fees Collected: ${total_fees:,.2f}
 """
         await query.edit_message_text(text=stats_text, parse_mode='Markdown')
     
@@ -431,7 +416,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 seller_id = int(text)
                 context.user_data['seller_id'] = seller_id
                 context.user_data['deal_step'] = 'amount'
-                await update.message.reply_text("✅ Seller ID saved!\n\nNow send amount (e.g., 100):")
+                await update.message.reply_text("✅ Seller ID saved!\n\nNow send amount (e.g., 1000):")
             except ValueError:
                 await update.message.reply_text("❌ Invalid ID. Please send a numeric ID.")
         
@@ -439,21 +424,33 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 amount = float(text)
                 context.user_data['amount'] = amount
-                context.user_data['deal_step'] = 'description'
-                await update.message.reply_text("✅ Amount saved!\n\nNow describe the deal:")
+                context.user_data['deal_step'] = 'fees'
+                await update.message.reply_text("✅ Amount saved!\n\nNow send fees percentage (e.g., 5 for 5%):")
             except ValueError:
                 await update.message.reply_text("❌ Invalid amount. Please send a number.")
         
+        elif context.user_data.get('deal_step') == 'fees':
+            try:
+                fees = float(text.replace('%', ''))
+                context.user_data['fees'] = fees
+                context.user_data['deal_step'] = 'description'
+                await update.message.reply_text("✅ Fees saved!\n\nNow describe the deal (optional, or type 'skip'):")
+            except ValueError:
+                await update.message.reply_text("❌ Invalid fees. Please send a number.")
+        
         elif context.user_data.get('deal_step') == 'description':
-            description = text
+            description = text if text.lower() != 'skip' else ''
             
             # Create the deal
             buyer_id = context.user_data['buyer_id']
             seller_id = context.user_data['seller_id']
             amount = context.user_data['amount']
+            fees = context.user_data['fees']
             creator_id = update.effective_user.id
             
-            deal_id = bot.create_deal(creator_id, buyer_id, seller_id, amount, description)
+            deal_id, final_amount, fees_amount = bot.create_deal_with_fees(
+                creator_id, buyer_id, seller_id, amount, fees, description
+            )
             
             if deal_id:
                 success_text = f"""
@@ -462,8 +459,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📌 Deal ID: `{deal_id}`
 👤 Buyer: {buyer_id}
 👤 Seller: {seller_id}
-💰 Amount: ${amount:,.2f}
-📝 Description: {description}
+💰 Original Amount: ${amount:,.2f}
+📊 Fees: {fees}% (${fees_amount:,.2f})
+💵 Final Amount: ${final_amount:,.2f}
+📝 Description: {description or 'N/A'}
 📅 Status: PENDING
 
 Both parties must confirm this deal!
@@ -520,8 +519,8 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("id", get_id_command))
-    app.add_handler(CommandHandler("add", add_command))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("add", add_command))
     app.add_handler(CommandHandler("cleardeal", owner_clear_deals))
     app.add_handler(CommandHandler("deletedeal", owner_delete_deal))
     
