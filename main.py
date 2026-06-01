@@ -24,7 +24,7 @@ class EscrowBot:
     
     def __init__(self):
         self.init_database()
-        self.OWNER_ID = 7967147174
+        self.OWNER_ID = int(os.getenv('OWNER_ID', '0'))
     
     def init_database(self):
         """Create database tables if they don't exist"""
@@ -210,8 +210,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 2. Bot creates deal automatically
 3. Message gets deleted
 4. Fees calculated: 1000 - (1000 × 5%) = 950
-
-**Contact:** @underlimitz
 """
     await update.message.reply_text(help_text, parse_mode='Markdown')
 
